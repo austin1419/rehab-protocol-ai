@@ -16,6 +16,8 @@ export default function Auth() {
     setError(null);
     setMessage(null);
 
+    if (!supabase) return;
+
     if (mode === "signup") {
       const { error } = await supabase.auth.signUp({ email, password });
       if (error) {

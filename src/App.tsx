@@ -12,7 +12,7 @@ import {
 } from "recharts";
 import { format } from "date-fns";
 import { generateRehabProtocol } from "./services/protocolService";
-import { supabase } from "./lib/supabase";
+import { supabase, supabaseEnabled } from "./lib/supabase";
 import Auth from "./components/Auth";
 import { cn } from "./lib/utils";
 import type { RehabProtocol, ExerciseLog, LogEntry } from "./types";
@@ -132,10 +132,14 @@ const BodyMap = ({ selected, onSelect }: { selected: string; onSelect: (loc: str
 // ─── Main App ────────────────────────────────────────────────────────
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
-  const [authLoading, setAuthLoading] = useState(true);
+  const [authLoading, setAuthLoading] = useState(supabaseEnabled);
 
-  // Restore session on mount
+  // Restore session on mount (only if Supabase is configured)
   useEffect(() => {
+    if (!supabase) {
+      setAuthLoading(false);
+      return;
+    }
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
       setAuthLoading(false);
@@ -154,7 +158,8 @@ export default function App() {
     );
   }
 
-  if (!session) {
+  // If Supabase is configured and user isn't logged in, show auth
+  if (supabaseEnabled && !session) {
     return <Auth />;
   }
 
@@ -162,7 +167,7 @@ export default function App() {
 }
 
 // ─── Authenticated Main App ──────────────────────────────────────────
-function MainApp({ session }: { session: Session }) {
+function MainApp({ session }: { session: Session | null }) {
   const [injury, setInjury] = useState("");
   const [protocol, setProtocol] = useState<RehabProtocol | null>(null);
   const [activeProtocolId, setActiveProtocolId] = useState<string | null>(null);
@@ -220,6 +225,7 @@ function MainApp({ session }: { session: Session }) {
   }, [activeProtocolId]);
 
   const loadProtocols = async () => {
+    if (!supabase || !session) return;
     const { data } = await supabase
       .from("protocols")
       .select("id, injury_name, protocol_data, created_at, is_active")
@@ -236,6 +242,7 @@ function MainApp({ session }: { session: Session }) {
   };
 
   const loadLogs = async (protocolId: string) => {
+    if (!supabase) return;
     const { data } = await supabase
       .from("progress_logs")
       .select("*")
@@ -284,31 +291,33 @@ function MainApp({ session }: { session: Session }) {
     try {
       const result = await generateRehabProtocol(searchInjury);
 
-      // Deactivate old protocols, save new one
-      await supabase
-        .from("protocols")
-        .update({ is_active: false })
-        .eq("user_id", session.user.id);
+      // Save to Supabase if connected
+      if (supabase && session) {
+        await supabase
+          .from("protocols")
+          .update({ is_active: false })
+          .eq("user_id", session.user.id);
 
-      const { data: inserted } = await supabase
-        .from("protocols")
-        .insert({
-          user_id: session.user.id,
-          injury_name: result.injuryName,
-          protocol_data: result,
-          is_active: true,
-        })
-        .select("id")
-        .single();
+        const { data: inserted } = await supabase
+          .from("protocols")
+          .insert({
+            user_id: session.user.id,
+            injury_name: result.injuryName,
+            protocol_data: result,
+            is_active: true,
+          })
+          .select("id")
+          .single();
 
-      if (inserted) {
-        setActiveProtocolId(inserted.id);
+        if (inserted) {
+          setActiveProtocolId(inserted.id);
+        }
+        await loadProtocols();
       }
 
       setProtocol(result);
       setSelectedPhase(0);
       setActiveTab("injury");
-      await loadProtocols();
       window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (err) {
       setError(err instanceof Error ? err.message : "An unexpected error occurred.");
@@ -338,30 +347,39 @@ function MainApp({ session }: { session: Session }) {
   };
 
   const addLog = async () => {
-    if (!activeProtocolId) return;
+    const newEntry: LogEntry = {
+      id: crypto.randomUUID(),
+      date: new Date().toISOString(),
+      painScore: newLog.painScore || 0,
+      romScore: newLog.romScore || 0,
+      completedExercises: activeWorkout
+        ? activeWorkout.exercises.every(e => e.completed)
+        : (newLog.completedExercises || false),
+      notes: newLog.notes || "",
+      painLocation: newLog.painLocation || undefined,
+      workoutDetails: activeWorkout ? {
+        phaseIndex: activeWorkout.phaseIndex,
+        exercises: activeWorkout.exercises
+      } : undefined,
+    };
 
-    const { data: inserted } = await supabase
-      .from("progress_logs")
-      .insert({
-        user_id: session.user.id,
-        protocol_id: activeProtocolId,
-        pain_score: newLog.painScore || 0,
-        rom_score: newLog.romScore || 0,
-        completed_exercises: activeWorkout
-          ? activeWorkout.exercises.every(e => e.completed)
-          : (newLog.completedExercises || false),
-        notes: newLog.notes || "",
-        pain_location: newLog.painLocation || null,
-        workout_details: activeWorkout ? {
-          phaseIndex: activeWorkout.phaseIndex,
-          exercises: activeWorkout.exercises
-        } : null,
-      })
-      .select("*")
-      .single();
-
-    if (inserted) {
+    if (supabase && session && activeProtocolId) {
+      await supabase
+        .from("progress_logs")
+        .insert({
+          user_id: session.user.id,
+          protocol_id: activeProtocolId,
+          pain_score: newEntry.painScore,
+          rom_score: newEntry.romScore,
+          completed_exercises: newEntry.completedExercises,
+          notes: newEntry.notes,
+          pain_location: newEntry.painLocation || null,
+          workout_details: newEntry.workoutDetails || null,
+        });
       await loadLogs(activeProtocolId);
+    } else {
+      // Local-only mode
+      setLogs([newEntry, ...logs]);
     }
 
     setShowLogForm(false);
@@ -370,7 +388,9 @@ function MainApp({ session }: { session: Session }) {
   };
 
   const deleteLog = async (id: string) => {
-    await supabase.from("progress_logs").delete().eq("id", id);
+    if (supabase) {
+      await supabase.from("progress_logs").delete().eq("id", id);
+    }
     setLogs(logs.filter(l => l.id !== id));
   };
 
@@ -424,7 +444,7 @@ Generated by RehabProtocol AI
   };
 
   const handleSignOut = async () => {
-    await supabase.auth.signOut();
+    if (supabase) await supabase.auth.signOut();
   };
 
   // ─── Render ────────────────────────────────────────────────────────
@@ -852,7 +872,7 @@ Generated by RehabProtocol AI
               <div className="flex items-center gap-6 mb-8">
                 <div className="w-20 h-20 rounded-2xl bg-slate-100 flex items-center justify-center text-slate-400"><User size={40} /></div>
                 <div>
-                  <h2 className="text-2xl font-bold text-slate-900">{session.user.email}</h2>
+                  <h2 className="text-2xl font-bold text-slate-900">{session?.user?.email || "Guest"}</h2>
                   <p className="text-slate-500">Managing {savedProtocols.length} protocols</p>
                 </div>
               </div>
@@ -883,8 +903,10 @@ Generated by RehabProtocol AI
                     <button
                       key={p.id}
                       onClick={async () => {
-                        await supabase.from("protocols").update({ is_active: false }).eq("user_id", session.user.id);
-                        await supabase.from("protocols").update({ is_active: true }).eq("id", p.id);
+                        if (supabase && session) {
+                          await supabase.from("protocols").update({ is_active: false }).eq("user_id", session.user.id);
+                          await supabase.from("protocols").update({ is_active: true }).eq("id", p.id);
+                        }
                         setActiveProtocolId(p.id);
                         setProtocol(p.protocol_data);
                         setActiveTab("injury");
